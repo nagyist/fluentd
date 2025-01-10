@@ -12,13 +12,14 @@ require 'fluent/plugin/compressable'
 require 'timecop'
 
 class ForwardInputTest < Test::Unit::TestCase
- include Fluent::Plugin::Compressable
+  include Fluent::Plugin::Compressable
 
   def setup
     Fluent::Test.setup
     @responses = []  # for testing responses after sending data
     @d = nil
-    @port = unused_port
+    # forward plugin uses TCP and UDP sockets on the same port number
+    @port = unused_port(protocol: :all)
   end
 
   def teardown

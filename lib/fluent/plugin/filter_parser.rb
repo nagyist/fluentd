@@ -54,21 +54,31 @@ module Fluent::Plugin
       @parser = parser_create
     end
 
-    FAILED_RESULT = [nil, nil].freeze # reduce allocation cost
     REPLACE_CHAR = '?'.freeze
 
-    def filter_with_time(tag, time, record)
-      raw_value = @accessor.call(record)
-      if raw_value.nil?
-        if @emit_invalid_record_to_error
-          router.emit_error_event(tag, time, record, ArgumentError.new("#{@key_name} does not exist"))
-        end
-        if @reserve_data
-          return time, handle_parsed(tag, record, time, {})
-        else
-          return FAILED_RESULT
+    def filter_stream(tag, es)
+      new_es = Fluent::MultiEventStream.new
+      es.each do |time, record|
+        begin
+          raw_value = @accessor.call(record)
+          if raw_value.nil?
+            new_es.add(time, handle_parsed(tag, record, time, {})) if @reserve_data
+            raise ArgumentError, "#{@key_name} does not exist"
+          else
+            filter_one_record(tag, time, record, raw_value) do |result_time, result_record|
+              new_es.add(result_time, result_record)
+            end
+          end
+        rescue => e
+          router.emit_error_event(tag, time, record, e) if @emit_invalid_record_to_error
         end
       end
+      new_es
+    end
+
+    private
+
+    def filter_one_record(tag, time, record, raw_value)
       begin
         @parser.parse(raw_value) do |t, values|
           if values
@@ -78,27 +88,17 @@ module Fluent::Plugin
                   t.nil? ? time : t
                 end
             @accessor.delete(record) if @remove_key_name_field
-            r = handle_parsed(tag, record, t, values)
-            return t, r
           else
-            if @emit_invalid_record_to_error
-              router.emit_error_event(tag, time, record, Fluent::Plugin::Parser::ParserError.new("pattern not matched with data '#{raw_value}'"))
-            end
-            if @reserve_data
-              t = time
-              r = handle_parsed(tag, record, time, {})
-              return t, r
-            else
-              return FAILED_RESULT
-            end
+            router.emit_error_event(tag, time, record, Fluent::Plugin::Parser::ParserError.new("pattern not matched with data '#{raw_value}'")) if @emit_invalid_record_to_error
+            next unless @reserve_data
+            t = time
+            values = {}
           end
+          yield(t, handle_parsed(tag, record, t, values))
         end
+
       rescue Fluent::Plugin::Parser::ParserError => e
-        if @emit_invalid_record_to_error
-          raise e
-        else
-          return FAILED_RESULT
-        end
+        raise e
       rescue ArgumentError => e
         raise unless @replace_invalid_sequence
         raise unless e.message.index("invalid byte sequence in") == 0
@@ -106,15 +106,9 @@ module Fluent::Plugin
         raw_value = raw_value.scrub(REPLACE_CHAR)
         retry
       rescue => e
-        if @emit_invalid_record_to_error
-          raise Fluent::Plugin::Parser::ParserError, "parse failed #{e.message}"
-        else
-          return FAILED_RESULT
-        end
+        raise Fluent::Plugin::Parser::ParserError, "parse failed #{e.message}"
       end
     end
-
-    private
 
     def handle_parsed(tag, record, t, values)
       if values && @inject_key_prefix

@@ -1538,6 +1538,147 @@ class TailInputTest < Test::Unit::TestCase
       assert_equal(ex_paths - [ex_paths.last], plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
     end
 
+    sub_test_case "expand_paths with glob" do |data|
+      sub_test_case "extended_glob" do
+        data("curly braces"          => [true, "always", "test/plugin/data/log_numeric/{0,1}*.log"],
+             "square brackets"       => [true, "always", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [true, "always", "test/plugin/data/log/*.log"],
+             "one character matcher" => [true, "always", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p_and_almost_set_of_patterns
+          result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "path_delimiter" => "|",
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          plugin = create_driver(config, false).instance
+          assert_equal(result, !!plugin.use_glob?(path))
+        end
+
+        data("curly braces"          => [true, false, "extended", "test/plugin/data/log_numeric/{0,1}*.log"],
+             "square brackets"       => [false, true, "extended", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [false, true, "extended", "test/plugin/data/log/*.log"],
+             "one character matcher" => [false, true, "extended", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p
+          emit_exception_p, result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          if emit_exception_p
+            assert_raise(Fluent::ConfigError) do
+              plugin = create_driver(config, false).instance
+            end
+          else
+            plugin = create_driver(config, false).instance
+            assert_equal(result, !!plugin.use_glob?(path))
+          end
+        end
+      end
+
+      sub_test_case "only_use_backward_compatible" do
+        data("square brackets"       => [false, "backward_compatible", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [true,  "backward_compatible", "test/plugin/data/log/*.log"],
+             "one character matcher" => [false, "backward_compatible", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p
+          result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          plugin = create_driver(config, false).instance
+          assert_equal(result, !!plugin.use_glob?(path))
+        end
+      end
+    end
+
+    def ex_config_with_brackets
+      config_element("", "", {
+                     "tag" => "tail",
+                     "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                     "format" => "none",
+                     "pos_file" => "#{@tmp_dir}/tail.pos",
+                     "read_from_head" => true,
+                     "refresh_interval" => 30,
+                     "glob_policy" => "extended",
+                     "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                     "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                   })
+    end
+
+    def test_config_with_always_with_default_delimiter
+      assert_raise(Fluent::ConfigError) do
+        config = config_element("", "", {
+                         "tag" => "tail",
+                         "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                         "format" => "none",
+                         "pos_file" => "#{@tmp_dir}/tail.pos",
+                         "read_from_head" => true,
+                         "refresh_interval" => 30,
+                         "glob_policy" => "always",
+                         "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                         "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                       })
+
+        create_driver(config, false).instance
+      end
+    end
+
+    def test_config_with_always_with_custom_delimiter
+      assert_nothing_raised do
+        config = config_element("", "", {
+                         "tag" => "tail",
+                         "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                         "format" => "none",
+                         "pos_file" => "#{@tmp_dir}/tail.pos",
+                         "read_from_head" => true,
+                         "refresh_interval" => 30,
+                         "glob_policy" => "always",
+                         "path_delimiter" => "|",
+                         "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                         "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                       })
+
+        create_driver(config, false).instance
+      end
+    end
+
+    def test_expand_paths_with_brackets
+      expanded_paths = [
+        create_target_info('test/plugin/data/log_numeric/01.log'),
+        create_target_info('test/plugin/data/log_numeric/02.log'),
+        create_target_info('test/plugin/data/log_numeric/12.log'),
+        create_target_info('test/plugin/data/log_numeric/14.log'),
+      ]
+
+      plugin = create_driver(ex_config_with_brackets, false).instance
+      assert_equal(expanded_paths - [expanded_paths.first], plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+
     def test_expand_paths_with_duplicate_configuration
       expanded_paths = [
         create_target_info('test/plugin/data/log/foo/bar.log'),
@@ -1737,13 +1878,6 @@ class TailInputTest < Test::Unit::TestCase
     plugin.instance_eval do
       @pf = Fluent::Plugin::TailInput::PositionFile.load(sio, EX_FOLLOW_INODES, {}, logger: $log)
       @loop = Coolio::Loop.new
-      opened_file_metrics = Fluent::Plugin::LocalMetrics.new
-      opened_file_metrics.configure(config_element('metrics', '', {}))
-      closed_file_metrics = Fluent::Plugin::LocalMetrics.new
-      closed_file_metrics.configure(config_element('metrics', '', {}))
-      rotated_file_metrics = Fluent::Plugin::LocalMetrics.new
-      rotated_file_metrics.configure(config_element('metrics', '', {}))
-      @metrics = Fluent::Plugin::TailInput::MetricsInfo.new(opened_file_metrics, closed_file_metrics, rotated_file_metrics)
     end
 
     Timecop.freeze(2010, 1, 2, 3, 4, 5) do
@@ -1869,41 +2003,6 @@ class TailInputTest < Test::Unit::TestCase
       plugin = d.instance
       mock(plugin.router).emit_stream('pre.foo.bar.log.post', anything).once
       plugin.receive_lines(['foo', 'bar'], DummyWatcher.new('foo.bar.log'))
-    end
-
-    data(
-      small: ["128", 128],
-      KiB: ["1k", 1024]
-    )
-    test 'max_line_size' do |(label, size)|
-      config = config_element("", "", {
-                                "tag" => "max_line_size",
-                                "path" => "#{@tmp_dir}/with_long_lines.txt",
-                                "format" => "none",
-                                "read_from_head" => true,
-                                "max_line_size" => label,
-                                "log_level" => "debug"
-                              })
-      Fluent::FileWrapper.open("#{@tmp_dir}/with_long_lines.txt", "w+") do |f|
-        f.puts "foo"
-        f.puts "x" * size # 'x' * size + \n > @max_line_size
-        f.puts "bar"
-      end
-      d = create_driver(config, false)
-      timestamp = Time.parse("Mon Nov 29 11:22:33 UTC 2021")
-      Timecop.freeze(timestamp)
-      d.run(expect_records: 2)
-      assert_equal([
-                     [{"message" => "foo"},{"message" => "bar"}],
-                     [
-                       "2021-11-29 11:22:33 +0000 [warn]: received line length is longer than #{size}\n",
-                       "2021-11-29 11:22:33 +0000 [debug]: skipped line: #{'x' * size}\n"
-                     ]
-                   ],
-                   [
-                     d.events.collect { |event| event.last },
-                     d.logs[-2..]
-                   ])
     end
   end
 
@@ -2139,15 +2238,6 @@ class TailInputTest < Test::Unit::TestCase
       config = common_follow_inode_config + config_element('', '', {"rotate_wait" => "1s", "limit_recently_modified" => "1s"})
 
       d = create_driver(config, false)
-      d.instance.instance_eval do
-        opened_file_metrics = Fluent::Plugin::LocalMetrics.new
-        opened_file_metrics.configure(config_element('metrics', '', {}))
-        closed_file_metrics = Fluent::Plugin::LocalMetrics.new
-        closed_file_metrics.configure(config_element('metrics', '', {}))
-        rotated_file_metrics = Fluent::Plugin::LocalMetrics.new
-        rotated_file_metrics.configure(config_element('metrics', '', {}))
-        @metrics = Fluent::Plugin::TailInput::MetricsInfo.new(opened_file_metrics, closed_file_metrics, rotated_file_metrics)
-      end
 
       Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
         f.puts "test1"
@@ -3016,5 +3106,300 @@ class TailInputTest < Test::Unit::TestCase
         },
       )
     end
+
+    def test_next_rotation_occurs_very_fast_while_old_TW_still_waiting_rotate_wait
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "rotate_wait" => "3s",
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        mock.proxy(tw).close.once # Note: Currently, there is no harm in duplicate calls.
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        # Rotate again (Old TailWatcher waiting rotate_wait also calls update_watcher)
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+
+        # Wait rotate_wait to confirm that TailWatcher.close is not called in duplicate.
+        # (Note: Currently, there is no harm in duplicate calls)
+        sleep 4
+      end
+
+      inode_0 = tail_watchers[0]&.ino
+      inode_1 = tail_watchers[1]&.ino
+      inode_2 = tail_watchers[2]&.ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_2],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_0],
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_1],
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_2],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+  end
+
+  sub_test_case "Update watchers for rotation without follow_inodes" do
+    # The scenario where in_tail wrongly unwatches the PositionEntry.
+    # This is reported in https://github.com/fluent/fluentd/issues/3614.
+    def test_refreshTW_during_rotation
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt0",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          # In order to detach the old watcher quickly.
+          "rotate_wait" => "3s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+
+        # This reproduces the following situation:
+        #     `refresh_watchers` is called during the rotation process and it detects the current file being lost.
+        #     Then it stops and unwatches the TailWatcher.
+        d.instance.refresh_watchers
+
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` trys to add the new TailWatcher.
+        # After `rotate_wait` interval, the PositionEntry is unwatched.
+        # HOWEVER, the new TailWatcher is still using that PositionEntry, so this breaks the PositionFile!!
+        # That PositionEntry is removed from `PositionFile::map`, but it is still working and remaining in the real pos file.
+        sleep 5
+
+        # Append to the new current log file.
+        # The PositionEntry is updated although it does not exist in `PositionFile::map`.
+        #     `PositionFile::map`: empty
+        #     Real pos file: `.../tail.txt 0000000000000016 (inode)`
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        # Rotate again
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` trys to update the TailWatcher.
+        sleep 3
+
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+      end
+
+      pos_file_inode = tail_watchers[2].pe.read_inode
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            # The recorded path is old, but it is no problem. The path is not used when using follow_inodes.
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", pos_file_inode],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    def test_next_rotation_occurs_very_fast_while_old_TW_still_waiting_rotate_wait
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt0",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "rotate_wait" => "3s",
+          "refresh_interval" => "1h",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        mock.proxy(tw).close.once # Note: Currently, there is no harm in duplicate calls.
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        # Rotate again (Old TailWatcher waiting rotate_wait also calls update_watcher)
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+
+        # Wait rotate_wait to confirm that TailWatcher.close is not called in duplicate.
+        # (Note: Currently, there is no harm in duplicate calls)
+        sleep 4
+      end
+
+      pos_file_inode = tail_watchers[2].pe.read_inode
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", pos_file_inode],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+  end
+
+  data(
+    small: ["128", 128],
+    KiB: ["1k", 1024]
+  )
+  test 'max_line_size' do |(label, size)|
+    config = config_element("", "", {
+                              "tag" => "max_line_size",
+                              "path" => "#{@tmp_dir}/with_long_lines.txt",
+                              "format" => "none",
+                              "read_from_head" => true,
+                              "max_line_size" => label,
+                              "log_level" => "debug"
+                            })
+    Fluent::FileWrapper.open("#{@tmp_dir}/with_long_lines.txt", "w+") do |f|
+      f.puts "foo"
+      f.puts "x" * size # 'x' * size + \n > @max_line_size
+      f.puts "bar"
+    end
+    d = create_driver(config, false)
+    timestamp = Time.parse("Mon Nov 29 11:22:33 UTC 2021")
+    Timecop.freeze(timestamp)
+    d.run(expect_records: 2)
+    assert_equal([
+                    [{"message" => "foo"},{"message" => "bar"}],
+                    [
+                      "2021-11-29 11:22:33 +0000 [warn]: received line length is longer than #{size}\n",
+                      "2021-11-29 11:22:33 +0000 [debug]: skipped line: #{'x' * size}\n"
+                    ]
+                  ],
+                  [
+                    d.events.collect { |event| event.last },
+                    d.logs[-2..]
+                  ])
   end
 end

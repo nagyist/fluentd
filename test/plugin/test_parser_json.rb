@@ -8,6 +8,37 @@ class JsonParserTest < ::Test::Unit::TestCase
     @parser = Fluent::Test::Driver::Parser.new(Fluent::Plugin::JSONParser)
   end
 
+  sub_test_case "configure_json_parser" do
+    data("oj", [:oj, [Oj.method(:load), Oj::ParseError]])
+    data("json", [:json, [JSON.method(:load), JSON::ParserError]])
+    data("yajl", [:yajl, [Yajl.method(:load), Yajl::ParseError]])
+    def test_return_each_loader((input, expected_return))
+      result = @parser.instance.configure_json_parser(input)
+      assert_equal expected_return, result
+    end
+
+    def test_raise_exception_for_unknown_input
+      assert_raise RuntimeError do
+        @parser.instance.configure_json_parser(:unknown)
+      end
+    end
+
+    def test_fall_back_oj_to_yajl_if_oj_not_available
+      stub(Fluent::OjOptions).available? { false }
+
+      result = @parser.instance.configure_json_parser(:oj)
+
+      assert_equal [Yajl.method(:load), Yajl::ParseError], result
+      logs = @parser.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      assert_equal(
+        ["[info]: Oj is not installed, and failing back to Yajl for json parser\n"],
+        logs
+      )
+    end
+  end
+
   data('oj' => 'oj', 'yajl' => 'yajl')
   def test_parse(data)
     @parser.configure('json_parser' => data)
@@ -133,6 +164,112 @@ class JsonParserTest < ::Test::Unit::TestCase
         # closed, otherwise the test will block waiting for more input.
         wr.close
       end
+    end
+  end
+
+  sub_test_case "various record pattern" do
+    data("Only string", { record: '"message"', expected: [nil] }, keep: true)
+    data("Only string without quotation", { record: "message", expected: [nil] }, keep: true)
+    data("Only number", { record: "0", expected: [nil] }, keep: true)
+    data(
+      "Array of Hash",
+      {
+        record: '[{"k1": 1}, {"k2": 2}]',
+        expected: [{"k1" => 1}, {"k2" => 2}]
+      },
+      keep: true,
+    )
+    data(
+      "Array of both Hash and invalid",
+      {
+        record: '[{"k1": 1}, "string", {"k2": 2}, 0]',
+        expected: [{"k1" => 1}, nil, {"k2" => 2}, nil]
+      },
+      keep: true,
+    )
+    data(
+      "Array of all invalid",
+      {
+        record: '["string", 0, [{"k": 0}]]',
+        expected: [nil, nil, nil]
+      },
+      keep: true,
+    )
+
+    def test_oj(data)
+      parsed_records = []
+      @parser.configure("json_parser" => "oj")
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
+    end
+
+    def test_yajl(data)
+      parsed_records = []
+      @parser.configure("json_parser" => "yajl")
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
+    end
+
+    def test_json(json)
+      parsed_records = []
+      @parser.configure("json_parser" => "json")
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
+    end
+  end
+
+  # This becomes NoMethodError if a non-Hash object is passed to convert_values.
+  # https://github.com/fluent/fluentd/issues/4100
+  sub_test_case "execute_convert_values with null_empty_string" do
+    data("Only string", { record: '"message"', expected: [nil] }, keep: true)
+    data(
+      "Hash",
+      {
+        record: '{"k1": 1, "k2": ""}',
+        expected: [{"k1" => 1, "k2" => nil}]
+      },
+      keep: true,
+    )
+    data(
+      "Array of Hash",
+      {
+        record: '[{"k1": 1}, {"k2": ""}]',
+        expected: [{"k1" => 1}, {"k2" => nil}]
+      },
+      keep: true,
+    )
+
+    def test_oj(data)
+      parsed_records = []
+      @parser.configure("json_parser" => "oj", "null_empty_string" => true)
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
+    end
+
+    def test_yajl(data)
+      parsed_records = []
+      @parser.configure("json_parser" => "yajl", "null_empty_string" => true)
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
+    end
+
+    def test_json(json)
+      parsed_records = []
+      @parser.configure("json_parser" => "json", "null_empty_string" => true)
+      @parser.instance.parse(data[:record]) { |time, record|
+        parsed_records.append(record)
+      }
+      assert_equal(data[:expected], parsed_records)
     end
   end
 end

@@ -130,7 +130,7 @@ class FileOutputTest < Test::Unit::TestCase
           'path' => "#{TMP_DIR}/${tag}/${type}/conf_test.%Y%m%d.%H%M.log",
           'add_path_suffix' => 'false',
           'append' => "true",
-          'symlink_path' => "#{TMP_DIR}/conf_test.current.log",
+          'symlink_path' => "#{TMP_DIR}/${tag}/conf_test.current.log",
           'compress' => 'gzip',
           'recompress' => 'true',
         }, [
@@ -181,6 +181,26 @@ class FileOutputTest < Test::Unit::TestCase
       ])
       assert_nothing_raised do
         Fluent::Test::Driver::Output.new(Fluent::Plugin::NullOutput).configure(conf)
+      end
+    end
+
+    test 'warning for symlink_path not including correct placeholders corresponding to chunk keys' do
+      omit "Windows doesn't support symlink" if Fluent.windows?
+      conf = config_element('match', '**', {
+          'path' => "#{TMP_DIR}/${tag}/${key1}/${key2}/conf_test.%Y%m%d.%H%M.log",
+          'symlink_path' => "#{TMP_DIR}/conf_test.current.log",
+        }, [
+          config_element('buffer', 'time,tag,key1,key2', {
+              '@type' => 'file',
+              'timekey' => '1d',
+              'path' => "#{TMP_DIR}/buf_conf_test",
+          }),
+      ])
+      assert_nothing_raised do
+        d = create_driver(conf)
+        assert do
+          d.logs.count { |log| log.include?("multiple chunks are competing for a single symlink_path") } == 2
+        end
       end
     end
   end
@@ -314,7 +334,7 @@ class FileOutputTest < Test::Unit::TestCase
       assert_equal r5, d.formatted[4]
 
       read_gunzip = ->(path){
-        File.open(path){ |fio|
+        File.open(path, 'rb'){ |fio|
           Zlib::GzipReader.new(StringIO.new(fio.read)).read
         }
       }
@@ -771,9 +791,9 @@ class FileOutputTest < Test::Unit::TestCase
       end
       path = d.instance.last_written_path
       assert_equal "#{TMP_DIR}/out_file_test.2011-01-02-13.log", path
-     end
+    end
 
-     test '*' do
+    test '*' do
       d = create_driver(%[
         path #{TMP_DIR}/out_file_test.*.txt
         time_slice_format %Y-%m-%d-%H

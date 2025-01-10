@@ -7,6 +7,7 @@ require 'webrick/https'
 require 'net/http'
 require 'uri'
 require 'json'
+require 'aws-sdk-core'
 
 # WEBrick's ProcHandler doesn't handle PUT by default
 module WEBrick::HTTPServlet
@@ -74,21 +75,30 @@ class HTTPOutputTest < Test::Unit::TestCase
         @@result.headers[key] = value
       end
 
+      body = ""
       data = []
+
+      case req['content-encoding']
+      when 'gzip'
+        body = Zlib::GzipReader.new(StringIO.new(req.body)).read
+      else 
+        body = req.body
+      end
+
       case req.content_type
       when 'application/x-ndjson'
-        req.body.each_line { |l|
+        body.each_line { |l|
           data << JSON.parse(l)
         }
       when 'application/json'
-        data = JSON.parse(req.body)
+        data = JSON.parse(body)
       when 'text/plain'
         # Use single_value in this test
-        req.body.each_line { |line|
+        body.each_line { |line|
           data << line.chomp
         }
       else
-        data << req.body
+        data << body
       end
       @@result.data = data
 
@@ -390,6 +400,97 @@ class HTTPOutputTest < Test::Unit::TestCase
     end
   end
 
+
+  sub_test_case 'aws sigv4 auth' do
+    setup do
+      @@fake_aws_credentials = Aws::Credentials.new(
+        'fakeaccess',
+        'fakesecret',
+        'fake session token'
+      )
+    end
+
+    def server_port
+      19883
+    end
+
+    def test_aws_sigv4_sts_role_arn
+      stub(Aws::AssumeRoleCredentials).new do |credentials_provider|
+        stub(credentials_provider).credentials {
+          @@fake_aws_credentials
+        }
+        credentials_provider
+      end
+
+      d = create_driver(config + %[
+          <auth>
+            method aws_sigv4
+            aws_service someservice
+            aws_region my-region-1
+            aws_role_arn arn:aws:iam::123456789012:role/MyRole
+          </auth>
+        ])
+      d.run(default_tag: 'test.http') do
+        test_events.each { |event|
+          d.feed(event)
+        }
+      end
+
+      result = @@result
+      assert_equal 'POST', result.method
+      assert_equal 'application/x-ndjson', result.content_type
+      assert_equal test_events, result.data
+      assert_not_empty result.headers
+      assert_not_nil result.headers['authorization']
+      assert_match(/AWS4-HMAC-SHA256 Credential=[a-zA-Z0-9]*\/\d+\/my-region-1\/someservice\/aws4_request/, result.headers['authorization'])
+      assert_match(/SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token/, result.headers['authorization'])
+      assert_equal @@fake_aws_credentials.session_token, result.headers['x-amz-security-token']
+      assert_not_nil result.headers['x-amz-content-sha256']
+      assert_not_empty result.headers['x-amz-content-sha256']
+      assert_not_nil result.headers['x-amz-security-token']
+      assert_not_empty result.headers['x-amz-security-token']
+      assert_not_nil result.headers['x-amz-date']
+      assert_not_empty result.headers['x-amz-date']
+    end
+
+    def test_aws_sigv4_no_role
+      stub(Aws::CredentialProviderChain).new do |provider_chain|
+        stub(provider_chain).resolve {
+          @@fake_aws_credentials
+        }
+        provider_chain
+      end
+      d = create_driver(config + %[
+          <auth>
+            method aws_sigv4
+            aws_service someservice
+            aws_region my-region-1
+          </auth>
+        ])
+      d.run(default_tag: 'test.http') do
+        test_events.each { |event|
+          d.feed(event)
+        }
+      end
+
+      result = @@result
+      assert_equal 'POST', result.method
+      assert_equal 'application/x-ndjson', result.content_type
+      assert_equal test_events, result.data
+      assert_not_empty result.headers
+      assert_not_nil result.headers['authorization']
+      assert_match(/AWS4-HMAC-SHA256 Credential=[a-zA-Z0-9]*\/\d+\/my-region-1\/someservice\/aws4_request/, result.headers['authorization'])
+      assert_match(/SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token/, result.headers['authorization'])
+      assert_equal @@fake_aws_credentials.session_token, result.headers['x-amz-security-token']
+      assert_not_nil result.headers['x-amz-content-sha256']
+      assert_not_empty result.headers['x-amz-content-sha256']
+      assert_not_nil result.headers['x-amz-security-token']
+      assert_not_empty result.headers['x-amz-security-token']
+      assert_not_nil result.headers['x-amz-date']
+      assert_not_empty result.headers['x-amz-date']
+    end
+  end
+
   sub_test_case 'HTTPS' do
     def server_port
       19882
@@ -423,6 +524,77 @@ class HTTPOutputTest < Test::Unit::TestCase
       assert_equal 'POST', result.method
       assert_equal 'application/x-ndjson', result.content_type
       assert_equal test_events, result.data
+      assert_not_empty result.headers
+    end
+  end
+
+  sub_test_case 'GZIP' do
+    def server_port
+      19882
+    end
+
+    data(:json_array, [false, true])
+    data(:buffer_compress, ["text", "gzip"])
+    def test_write_with_gzip
+      d = create_driver(%[
+        endpoint http://127.0.0.1:#{server_port}/test
+        compress gzip
+        json_array #{data[:json_array]}
+        <buffer>
+          @type memory
+          compress #{data[:buffer_compress]}
+        </buffer>
+      ])
+      d.run(default_tag: 'test.http') do
+        test_events.each { |event|
+          d.feed(event)
+        }
+      end
+
+      result = @@result
+      assert_equal 'POST', result.method
+      assert_equal(
+        data[:json_array] ? 'application/json' : 'application/x-ndjson',
+        result.content_type
+      )
+      assert_equal 'gzip', result.headers['content-encoding']
+      assert_equal test_events,  result.data
+      assert_not_empty result.headers
+    end
+  end
+
+  sub_test_case 'connection_reuse' do
+    def server_port
+      19883
+    end
+
+    def test_connection_recreation
+      d = create_driver(%[
+        endpoint http://127.0.0.1:#{server_port}/test
+        reuse_connections true
+      ])
+
+      d.run(default_tag: 'test.http', shutdown: false) do
+        d.feed(test_events[0])
+      end
+
+      data = @@result.data
+
+      # Restart server to simulate connection loss
+      @@http_server_thread.kill
+      @@http_server_thread.join
+      @@http_server_thread = Thread.new do
+        run_http_server
+      end
+
+      d.run(default_tag: 'test.http') do
+        d.feed(test_events[1])
+      end
+
+      result = @@result
+      assert_equal 'POST', result.method
+      assert_equal 'application/x-ndjson', result.content_type
+      assert_equal test_events, data.concat(result.data)
       assert_not_empty result.headers
     end
   end

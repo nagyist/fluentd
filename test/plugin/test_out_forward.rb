@@ -12,7 +12,8 @@ class ForwardOutputTest < Test::Unit::TestCase
     FileUtils.rm_rf(TMP_DIR)
     FileUtils.mkdir_p(TMP_DIR)
     @d = nil
-    @target_port = unused_port
+    # forward plugin uses TCP and UDP sockets on the same port number
+    @target_port = unused_port(protocol: :all)
   end
 
   def teardown
@@ -156,7 +157,14 @@ EOL
     normal_conf = config_element('match', '**', {}, [
         config_element('server', '', {'name' => 'test', 'host' => 'unexisting.yaaaaaaaaaaaaaay.host.example.com'})
       ])
-    assert_raise SocketError do
+
+    if Socket.const_defined?(:ResolutionError) # as of Ruby 3.3
+      error_class = Socket::ResolutionError
+    else
+      error_class = SocketError
+    end
+
+    assert_raise error_class do
       create_driver(normal_conf)
     end
 
@@ -165,7 +173,7 @@ EOL
       ])
     @d = d = create_driver(conf)
     expected_log = "failed to resolve node name when configured"
-    expected_detail = 'server="test" error_class=SocketError'
+    expected_detail = "server=\"test\" error_class=#{error_class.name}"
     logs = d.logs
     assert{ logs.any?{|log| log.include?(expected_log) && log.include?(expected_detail) } }
   end
@@ -603,7 +611,6 @@ EOL
 
     @d = d = create_driver(config + %[
       require_ack_response true
-      ack_response_timeout 1s
       <buffer tag>
         flush_mode immediate
         retry_type periodic
@@ -651,7 +658,6 @@ EOL
 
     @d = d = create_driver(config + %[
       require_ack_response true
-      ack_response_timeout 10s
       <buffer tag>
         flush_mode immediate
         retry_type periodic
@@ -1241,27 +1247,22 @@ EOL
     target_input_driver = create_target_input_driver(conf: target_config)
     output_conf = config
     d = create_driver(output_conf)
-    d.instance_start
 
-    begin
-      chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
-      mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
-                                               linger_timeout: anything,
-                                               send_timeout: anything,
-                                               recv_timeout: anything,
-                                               connect_timeout: anything
-                                              ) { |sock| mock(sock).close.once; sock }.twice
+    chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
+    mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
+                                             linger_timeout: anything,
+                                             send_timeout: anything,
+                                             recv_timeout: anything,
+                                             connect_timeout: anything
+                                            ) { |sock| mock(sock).close.once; sock }.twice
 
-      target_input_driver.run(timeout: 15) do
-        d.run(shutdown: false) do
-          node = d.instance.nodes.first
-          2.times do
-            node.send_data('test', chunk) rescue nil
-          end
+    target_input_driver.run(timeout: 15) do
+      d.run do
+        node = d.instance.nodes.first
+        2.times do
+          node.send_data('test', chunk) rescue nil
         end
       end
-    ensure
-      d.instance_shutdown
     end
   end
 
@@ -1275,7 +1276,6 @@ EOL
       port #{@target_port}
     </server>
     ])
-    d.instance_start
     assert_nothing_raised { d.run }
   end
 
@@ -1287,33 +1287,28 @@ EOL
         keepalive_timeout 2
       ]
       d = create_driver(output_conf)
-      d.instance_start
 
-      begin
-        chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
-        mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
-                                                 linger_timeout: anything,
-                                                 send_timeout: anything,
-                                                 recv_timeout: anything,
-                                                 connect_timeout: anything
-                                                ) { |sock| mock(sock).close.once; sock }.once
+      chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
+      mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
+                                               linger_timeout: anything,
+                                               send_timeout: anything,
+                                               recv_timeout: anything,
+                                               connect_timeout: anything
+                                              ) { |sock| mock(sock).close.once; sock }.once
 
-        target_input_driver.run(timeout: 15) do
-          d.run(shutdown: false) do
-            node = d.instance.nodes.first
-            2.times do
-              node.send_data('test', chunk) rescue nil
-            end
+      target_input_driver.run(timeout: 15) do
+        d.run do
+          node = d.instance.nodes.first
+          2.times do
+            node.send_data('test', chunk) rescue nil
           end
         end
-      ensure
-        d.instance_shutdown
       end
     end
 
     test 'create timer of purging obsolete sockets' do
       output_conf = config + %[keepalive true]
-      d = create_driver(output_conf)
+      @d = d = create_driver(output_conf)
 
       mock(d.instance).timer_execute(:out_forward_heartbeat_request, 1).once
       mock(d.instance).timer_execute(:out_forward_keep_alived_socket_watcher, 5).once
@@ -1329,7 +1324,6 @@ EOL
           keepalive_timeout 2
         ]
         d = create_driver(output_conf)
-        d.instance_start
 
         chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
         mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,

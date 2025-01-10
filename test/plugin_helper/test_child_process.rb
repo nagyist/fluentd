@@ -515,6 +515,9 @@ class ChildProcessTest < Test::Unit::TestCase
   end
 
   test 'can scrub characters without exceptions' do
+    if Gem::Version.create(RUBY_VERSION) >= Gem::Version.create('3.3.0')
+      pend "Behaviour of IO#set_encoding is changed as of Ruby 3.3 (#4058)"
+    end
     m = Mutex.new
     str = nil
     Timeout.timeout(TEST_DEADLOCK_TIMEOUT) do
@@ -529,19 +532,25 @@ class ChildProcessTest < Test::Unit::TestCase
       sleep TEST_WAIT_INTERVAL_FOR_BLOCK_RUNNING until m.locked? || ran
       m.lock
       assert_equal Encoding.find('utf-8'), str.encoding
-      expected = "\xEF\xBF\xBD\xEF\xBF\xBD\x00\xEF\xBF\xBD\xEF\xBF\xBD".force_encoding("utf-8")
+      replacement = "\uFFFD" # U+FFFD (REPLACEMENT CHARACTER)
+      nul = "\x00" # U+0000 (NUL)
+      expected = replacement * 2 + nul + replacement * 2
       assert_equal expected, str
       @d.stop; @d.shutdown; @d.close; @d.terminate
     end
   end
 
   test 'can scrub characters without exceptions and replace specified chars' do
+    if Gem::Version.create(RUBY_VERSION) >= Gem::Version.create('3.3.0')
+      pend "Behaviour of IO#set_encoding is changed as of Ruby 3.3 (#4058)"
+    end
     m = Mutex.new
     str = nil
+    replacement = "?"
     Timeout.timeout(TEST_DEADLOCK_TIMEOUT) do
       ran = false
       args = ['-e', 'STDOUT.set_encoding("ascii-8bit"); STDOUT.write "\xFF\xFF\x00\xF0\xF0"']
-      @d.child_process_execute(:t13b, "ruby", arguments: args, mode: [:read], scrub: true, replace_string: '?') do |io|
+      @d.child_process_execute(:t13b, "ruby", arguments: args, mode: [:read], scrub: true, replace_string: replacement) do |io|
         m.lock
         ran = true
         str = io.read
@@ -550,7 +559,8 @@ class ChildProcessTest < Test::Unit::TestCase
       sleep TEST_WAIT_INTERVAL_FOR_BLOCK_RUNNING until m.locked? || ran
       m.lock
       assert_equal Encoding.find('utf-8'), str.encoding
-      expected = "??\x00??".force_encoding("utf-8")
+      nul = "\x00" # U+0000 (NUL)
+      expected = replacement * 2 + nul + replacement * 2
       assert_equal expected, str
       @d.stop; @d.shutdown; @d.close; @d.terminate
     end
@@ -559,7 +569,7 @@ class ChildProcessTest < Test::Unit::TestCase
   unless Fluent.windows?
     test 'can specify subprocess name' do
       io = IO.popen([["cat", "caaaaaaaaaaat"], '-'])
-      process_naming_enabled = (open("|ps opid,cmd"){|_io| _io.readlines }.count{|line| line.include?("caaaaaaaaaaat") } > 0)
+      process_naming_enabled = (IO.popen(["ps", "opid,cmd"]){|_io| _io.readlines }.count{|line| line.include?("caaaaaaaaaaat") } > 0)
       Process.kill(:TERM, io.pid) rescue nil
       io.close rescue nil
 
@@ -576,7 +586,7 @@ class ChildProcessTest < Test::Unit::TestCase
           m.lock
           ran = true
           pids << @d.child_process_id
-          proc_lines += open("|ps opid,cmd"){|_io| _io.readlines }
+          proc_lines += IO.popen(["ps", "opid,cmd"]){|_io| _io.readlines }
           m.unlock
           readio.read
         end
@@ -635,8 +645,8 @@ class ChildProcessTest < Test::Unit::TestCase
   unless Fluent.windows?
     test 'can change working directory' do
       # check my real /tmp directory (for mac)
-      cmd = %[|ruby -e 'Dir.chdir("/tmp"); puts Dir.pwd']
-      mytmpdir = open(cmd){|io| io.read.chomp }
+      cmd = ['ruby', '-e', 'Dir.chdir("/tmp"); puts Dir.pwd']
+      mytmpdir = IO.popen(cmd){|io| io.read.chomp }
 
       m = Mutex.new
       str = nil
