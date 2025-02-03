@@ -84,6 +84,8 @@ module Fluent::Plugin
     config_param :dump_error_log, :bool, default: true
     desc 'Add QUERY_ prefix query params to record'
     config_param :add_query_params, :bool, default: false
+    desc "Add prefix to incoming tag"
+    config_param :add_tag_prefix, :string, default: nil
 
     config_section :parse do
       config_set_default :@type, 'in_http'
@@ -119,6 +121,8 @@ module Fluent::Plugin
           raise Fluent::ConfigError, "Cannot enable cors_allow_credentials without specific origins"
         end
       end
+
+      raise Fluent::ConfigError, "'add_tag_prefix' parameter must not be empty" if @add_tag_prefix && @add_tag_prefix.empty?
 
       m = if @parser_configs.first['@type'] == 'in_http'
             @parser_msgpack = parser_create(usage: 'parser_in_http_msgpack', type: 'msgpack')
@@ -203,54 +207,25 @@ module Fluent::Plugin
       begin
         path = path_info[1..-1]  # remove /
         tag = path.split('/').join('.')
-        record_time, record = parse_params(params)
+        tag = "#{@add_tag_prefix}.#{tag}" if @add_tag_prefix
 
-        # Skip nil record
-        if record.nil?
-          log.debug { "incoming event is invalid: path=#{path_info} params=#{params.to_json}" }
-          if @respond_with_empty_img
-            return RESPONSE_IMG
-          else
-            if @use_204_response
-              return RESPONSE_204
-            else
-              return RESPONSE_200
-            end
+        mes = Fluent::MultiEventStream.new
+        parse_params(params) do |record_time, record|
+          if record.nil?
+            log.debug { "incoming event is invalid: path=#{path_info} params=#{params.to_json}" }
+            next
           end
-        end
 
-        mes = nil
-        # Support batched requests
-        if record.is_a?(Array)
-          mes = Fluent::MultiEventStream.new
-          record.each do |single_record|
-            add_params_to_record(single_record, params)
-
-            if param_time = params['time']
-              param_time = param_time.to_f
-              single_time = param_time.zero? ? Fluent::EventTime.now : @float_time_parser.parse(param_time)
-            elsif @custom_parser
-              single_time = @custom_parser.parse_time(single_record)
-              single_time, single_record = @custom_parser.convert_values(single_time, single_record)
-            else
-              single_time = convert_time_field(single_record)
-            end
-
-            mes.add(single_time, single_record)
-          end
-        else
           add_params_to_record(record, params)
 
           time = if param_time = params['time']
                    param_time = param_time.to_f
                    param_time.zero? ? Fluent::EventTime.now : @float_time_parser.parse(param_time)
                  else
-                   if record_time.nil?
-                     convert_time_field(record)
-                   else
-                     record_time
-                   end
+                   record_time.nil? ? convert_time_field(record) : record_time
                  end
+
+          mes.add(time, record)
         end
       rescue => e
         if @dump_error_log
@@ -261,11 +236,7 @@ module Fluent::Plugin
 
       # TODO server error
       begin
-        if mes
-          router.emit_stream(tag, mes)
-        else
-          router.emit(tag, time, record)
-        end
+        router.emit_stream(tag, mes) unless mes.empty?
       rescue => e
         if @dump_error_log
           log.error "failed to emit data", error: e
@@ -308,20 +279,18 @@ module Fluent::Plugin
     def parse_params_default(params)
       if msgpack = params['msgpack']
         @parser_msgpack.parse(msgpack) do |_time, record|
-          return nil, record
+          yield nil, record
         end
       elsif js = params['json']
         @parser_json.parse(js) do |_time, record|
-          return nil, record
+          yield nil, record
         end
       elsif ndjson = params['ndjson']
-        events = []
         ndjson.split(/\r?\n/).each do |js|
           @parser_json.parse(js) do |_time, record|
-            events.push(record)
+            yield nil, record
           end
         end
-        return nil, events
       else
         raise "'json', 'ndjson' or 'msgpack' parameter is required"
       end
@@ -329,10 +298,9 @@ module Fluent::Plugin
 
     def parse_params_with_parser(params)
       if content = params[EVENT_RECORD_PARAMETER]
-        @custom_parser.parse(content) { |time, record|
-          raise "Received event is not #{@format_name}: #{content}" if record.nil?
-          return time, record
-        }
+        @custom_parser.parse(content) do |time, record|
+          yield time, record
+        end
       else
         raise "'#{EVENT_RECORD_PARAMETER}' parameter is required"
       end
@@ -485,7 +453,7 @@ module Fluent::Plugin
       # Azure App Service sends GET requests for health checking purpose.
       # Respond with `200 OK` to accommodate it.
       def handle_get_request
-          return send_response_and_close(RES_200_STATUS, {}, "")
+        return send_response_and_close(RES_200_STATUS, {}, "")
       end
 
       # Web browsers can send an OPTIONS request before performing POST
@@ -573,6 +541,8 @@ module Fluent::Plugin
           params.update WEBrick::HTTPUtils.parse_form_data(@body, boundary)
         elsif /^application\/json/.match?(@content_type)
           params['json'] = @body
+        elsif /^application\/csp-report/.match?(@content_type)
+          params['json'] = @body
         elsif /^application\/msgpack/.match?(@content_type)
           params['msgpack'] = @body
         elsif /^application\/x-ndjson/.match?(@content_type)
@@ -580,7 +550,7 @@ module Fluent::Plugin
         end
         path_info = uri.path
 
-        if (@add_query_params) 
+        if (@add_query_params)
 
           query_params = WEBrick::HTTPUtils.parse_query(uri.query)
 

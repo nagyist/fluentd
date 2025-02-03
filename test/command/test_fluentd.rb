@@ -128,11 +128,14 @@ class TestFluentdCommand < ::Test::Unit::TestCase
 
   # ATTENTION: This stops taking logs when all `pattern_list` match or timeout,
   # so `patterns_not_match` can test only logs up to that point.
+  # You can pass a block to assert something after log matching.
   def assert_log_matches(cmdline, *pattern_list, patterns_not_match: [], timeout: 20, env: {})
     matched = false
     matched_wrongly = false
-    assert_error_msg = ""
+    error_msg_match = ""
     stdio_buf = ""
+    succeeded_block = true
+    error_msg_block = ""
     begin
       execute_command(cmdline, @tmp_dir, env) do |pid, stdout|
         begin
@@ -163,6 +166,13 @@ class TestFluentdCommand < ::Test::Unit::TestCase
               end
             end
           end
+
+          begin
+            yield if block_given?
+          rescue => e
+            succeeded_block = false
+            error_msg_block = "failed block execution after matching: #{e}"
+          end
         ensure
           if SUPERVISOR_PID_PATTERN =~ stdio_buf
             @supervisor_pid = $1.to_i
@@ -173,19 +183,19 @@ class TestFluentdCommand < ::Test::Unit::TestCase
         end
       end
     rescue Timeout::Error
-      assert_error_msg = "execution timeout"
+      error_msg_match = "execution timeout"
       # https://github.com/fluent/fluentd/issues/4095
       # On Windows, timeout without `@supervisor_pid` means that the test is invalid,
       # since the supervisor process will survive without being killed correctly.
       flunk("Invalid test: The pid of supervisor could not be taken, which is necessary on Windows.") if Fluent.windows? && @supervisor_pid.nil?
     rescue => e
-      assert_error_msg = "unexpected error in launching fluentd: #{e.inspect}"
+      error_msg_match = "unexpected error in launching fluentd: #{e.inspect}"
     else
-      assert_error_msg = "log doesn't match" unless matched
+      error_msg_match = "log doesn't match" unless matched
     end
 
     if patterns_not_match.empty?
-      assert_error_msg = build_message(assert_error_msg,
+      error_msg_match = build_message(error_msg_match,
                                        "<?>\nwas expected to include:\n<?>",
                                        stdio_buf, pattern_list)
     else
@@ -197,16 +207,17 @@ class TestFluentdCommand < ::Test::Unit::TestCase
                             lines.any?{|line| line.include?(ptn) }
                           end
         if matched_wrongly
-          assert_error_msg << "\n" unless assert_error_msg.empty?
-          assert_error_msg << "pattern exists in logs wrongly: #{ptn}"
+          error_msg_match << "\n" unless error_msg_match.empty?
+          error_msg_match << "pattern exists in logs wrongly: #{ptn}"
         end
       end
-      assert_error_msg = build_message(assert_error_msg,
+      error_msg_match = build_message(error_msg_match,
                                        "<?>\nwas expected to include:\n<?>\nand not include:\n<?>",
                                        stdio_buf, pattern_list, patterns_not_match)
     end
 
-    assert matched && !matched_wrongly, assert_error_msg
+    assert matched && !matched_wrongly, error_msg_match
+    assert succeeded_block, error_msg_block if block_given?
   end
 
   def assert_fluentd_fails_to_start(cmdline, *pattern_list, timeout: 20)
@@ -559,7 +570,7 @@ CONF
 
       assert_fluentd_fails_to_start(
         create_cmdline(conf_path, "-p", File.dirname(plugin_path)),
-        "in_buggy.rb:5: syntax error, unexpected end-of-input"
+        /in_buggy.rb:\d+:.+\(SyntaxError\)/
       )
     end
   end
@@ -941,7 +952,7 @@ CONF
       '-external-encoding' => '--external-encoding=utf-8',
       '-internal-encoding' => '--internal-encoding=utf-8',
     )
-    test "-E option is set to RUBYOPT" do |opt|
+    test "-E option is set to RUBYOPT" do |base_opt|
       conf = <<CONF
 <source>
   @type dummy
@@ -952,6 +963,7 @@ CONF
 </match>
 CONF
       conf_path = create_conf_file('rubyopt_test.conf', conf)
+      opt = base_opt.dup
       opt << " #{ENV['RUBYOPT']}" if ENV['RUBYOPT']
       assert_log_matches(
         create_cmdline(conf_path),
@@ -991,9 +1003,14 @@ CONF
 </match>
 CONF
       conf_path = create_conf_file('rubyopt_invalid_test.conf', conf)
+      if Gem::Version.create(RUBY_VERSION) >= Gem::Version.create('3.3.0')
+        expected_phrase = 'ruby: invalid switch in RUBYOPT'
+      else
+        expected_phrase = 'Invalid option is passed to RUBYOPT'
+      end
       assert_log_matches(
         create_cmdline(conf_path),
-        'Invalid option is passed to RUBYOPT',
+        expected_phrase,
         env: { 'RUBYOPT' => 'a' },
       )
     end
@@ -1158,7 +1175,7 @@ CONF
     end
   end
 
-  sub_test_case 'sahred socket options' do
+  sub_test_case 'shared socket options' do
     test 'enable shared socket by default' do
       conf = ""
       conf_path = create_conf_file('empty.conf', conf)
@@ -1280,6 +1297,235 @@ CONF
       assert File.exist?(conf_path)
       assert_log_matches(create_cmdline(conf_path, "--inline-config", inline_conf),
                          "[debug]")
+    end
+  end
+
+  sub_test_case "plugin option" do
+    test "should be the default value when not specifying" do
+      conf_path = create_conf_file('test.conf', <<~CONF)
+        <source>
+          @type monitor_agent
+        </source>
+      CONF
+      assert File.exist?(conf_path)
+      cmdline = create_cmdline(conf_path)
+
+      assert_log_matches(cmdline, "fluentd worker is now running") do
+        response = Net::HTTP.get(URI.parse("http://localhost:24220/api/config.json"))
+        actual_conf = JSON.parse(response)
+        assert_equal Fluent::Supervisor.default_options[:plugin_dirs], actual_conf["plugin_dirs"]
+      end
+    end
+
+    data(short: "-p")
+    data(long: "--plugin")
+    test "can be added by specifying the option" do |option_name|
+      conf_path = create_conf_file('test.conf', <<~CONF)
+        <source>
+          @type monitor_agent
+        </source>
+      CONF
+      assert File.exist?(conf_path)
+      cmdline = create_cmdline(conf_path, option_name, @tmp_dir, option_name, @tmp_dir)
+
+      assert_log_matches(cmdline, "fluentd worker is now running") do
+        response = Net::HTTP.get(URI.parse("http://localhost:24220/api/config.json"))
+        actual_conf = JSON.parse(response)
+        assert_equal Fluent::Supervisor.default_options[:plugin_dirs] + [@tmp_dir, @tmp_dir], actual_conf["plugin_dirs"]
+      end
+    end
+  end
+
+  sub_test_case "--with-source-only" do
+    setup do
+      omit "Not supported on Windows" if Fluent.windows?
+    end
+
+    test "should work without error" do
+      conf_path = create_conf_file("empty.conf", "")
+      assert File.exist?(conf_path)
+      assert_log_matches(create_cmdline(conf_path, "--with-source-only"),
+                         "with-source-only: the emitted data will be stored in the buffer files under",
+                         "fluentd worker is now running",
+                         patterns_not_match: ["[error]"])
+    end
+  end
+
+  sub_test_case "zero_downtime_restart" do
+    setup do
+      omit "Not supported on Windows" if Fluent.windows?
+    end
+
+    def conf(udp_port, tcp_port, syslog_port)
+      <<~CONF
+        <system>
+          rpc_endpoint localhost:24444
+        </system>
+        <source>
+          @type monitor_agent
+        </source>
+        <source>
+          @type udp
+          tag test.udp
+          port #{udp_port}
+          <parse>
+            @type none
+          </parse>
+        </source>
+        <source>
+          @type tcp
+          tag test.tcp
+          port #{tcp_port}
+          <parse>
+            @type none
+          </parse>
+        </source>
+        <source>
+          @type syslog
+          tag test.syslog
+          port #{syslog_port}
+        </source>
+        <filter test.**>
+          @type record_transformer
+          <record>
+            foo foo
+          </record>
+        </filter>
+        <match test.**>
+          @type stdout
+        </match>
+      CONF
+    end
+
+    def run_fluentd(config)
+      conf_path = create_conf_file("test.conf", config)
+      assert File.exist?(conf_path)
+      cmdline = create_cmdline(conf_path)
+
+      stdio_buf = ""
+      execute_command(cmdline) do |pid, stdout|
+        begin
+          waiting(60) do
+            while true
+              readables, _, _ = IO.select([stdout], nil, nil, 1)
+              next unless readables
+              break if readables.first.eof?
+
+              buf = eager_read(readables.first)
+              stdio_buf << buf
+              logs = buf.split("\n")
+
+              yield logs
+
+              break if buf.include? "finish test"
+            end
+          end
+        ensure
+          supervisor_pids = stdio_buf.scan(SUPERVISOR_PID_PATTERN)
+          @supervisor_pid = supervisor_pids.last.first.to_i if supervisor_pids.size >= 2
+          stdio_buf.scan(WORKER_PID_PATTERN) do |worker_pid|
+            @worker_pids << worker_pid.first.to_i
+          end
+        end
+      end
+    end
+
+    def send_udp(port, count:, interval_sec:)
+      count.times do |i|
+        s = UDPSocket.new
+        s.send("udp-#{i}", 0, "localhost", port)
+        s.close
+        sleep interval_sec
+      end
+    end
+
+    def send_tcp(port, count:, interval_sec:)
+      count.times do |i|
+        s = TCPSocket.new("localhost", port)
+        s.write("tcp-#{i}\n")
+        s.close
+        sleep interval_sec
+      end
+    end
+
+    def send_syslog(port, count:, interval_sec:)
+      count.times do |i|
+        s = UDPSocket.new
+        s.send("<6>Sep 10 00:00:00 localhost test: syslog-#{i}", 0, "localhost", port)
+        s.close
+        sleep interval_sec
+      end
+    end
+
+    def send_end(port)
+      s = TCPSocket.new("localhost", port)
+      s.write("finish test\n")
+      s.close
+    end
+
+    test "should restart with zero downtime (no data loss)" do
+      udp_port, syslog_port = unused_port(2, protocol: :udp)
+      tcp_port = unused_port(protocol: :tcp)
+
+      client_threads = []
+      end_thread = nil
+      records_by_type = {
+        "udp" => [],
+        "tcp" => [],
+        "syslog" => [],
+      }
+
+      phase = "startup"
+      run_fluentd(conf(udp_port, tcp_port, syslog_port)) do |logs|
+        logs.each do |log|
+          next unless /"message":"(udp|tcp|syslog)-(\d+)","foo":"foo"}/ =~ log
+          type = $1
+          num = $2.to_i
+          assert_true records_by_type.key?(type)
+          records_by_type[type].append(num)
+        end
+
+        if phase == "startup" and logs.any? { |log| log.include?("fluentd worker is now running worker") }
+          phase = "zero-downtime-restart"
+
+          client_threads << Thread.new do
+            send_udp(udp_port, count: 500, interval_sec: 0.01)
+          end
+          client_threads << Thread.new do
+            send_tcp(tcp_port, count: 500, interval_sec: 0.01)
+          end
+          client_threads << Thread.new do
+            send_syslog(syslog_port, count: 500, interval_sec: 0.01)
+          end
+
+          sleep 1
+          response = Net::HTTP.get(URI.parse("http://localhost:24444/api/processes.zeroDowntimeRestart"))
+          assert_equal '{"ok":true}', response
+        elsif phase == "zero-downtime-restart" and logs.any? { |log| log.include?("zero-downtime-restart: done all sequences") }
+          phase = "flush"
+          response = Net::HTTP.get(URI.parse("http://localhost:24444/api/plugins.flushBuffers"))
+          assert_equal '{"ok":true}', response
+        elsif phase == "flush"
+          phase = "done"
+          end_thread = Thread.new do
+            client_threads.each(&:join)
+            sleep 5 # make sure to flush each chunk (1s flush interval for 1chunk)
+            send_end(tcp_port)
+          end
+        end
+      end
+
+      assert_equal(
+        [(0..499).to_a, (0..499).to_a, (0..499).to_a],
+        [
+          records_by_type["udp"].sort,
+          records_by_type["tcp"].sort,
+          records_by_type["syslog"].sort,
+        ]
+      )
+    ensure
+      client_threads.each(&:kill)
+      end_thread&.kill
     end
   end
 end

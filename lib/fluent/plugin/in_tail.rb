@@ -36,7 +36,7 @@ module Fluent::Plugin
     helpers :timer, :event_loop, :parser, :compat_parameters
 
     RESERVED_CHARS = ['/', '*', '%'].freeze
-    MetricsInfo = Struct.new(:opened, :closed, :rotated)
+    MetricsInfo = Struct.new(:opened, :closed, :rotated, :throttled)
 
     class WatcherSetupError < StandardError
       def initialize(msg)
@@ -52,6 +52,7 @@ module Fluent::Plugin
       super
       @paths = []
       @tails = {}
+      @tails_rotate_wait = {}
       @pf_file = nil
       @pf = nil
       @ignore_list = []
@@ -64,6 +65,8 @@ module Fluent::Plugin
     config_param :path, :string
     desc 'path delimiter used for spliting path config'
     config_param :path_delimiter, :string, default: ','
+    desc 'Choose using glob patterns. Adding capabilities to handle [] and ?, and {}.'
+    config_param :glob_policy, :enum, list: [:backward_compatible, :extended, :always], default: :backward_compatible
     desc 'The tag of the event.'
     config_param :tag, :string
     desc 'The paths to exclude the files from watcher list.'
@@ -140,6 +143,14 @@ module Fluent::Plugin
         raise Fluent::ConfigError, "either of enable_watch_timer or enable_stat_watcher must be true"
       end
 
+      if @glob_policy == :always && @path_delimiter == ','
+        raise Fluent::ConfigError, "cannot use glob_policy as always with the default path_delimitor: `,\""
+      end
+
+      if @glob_policy == :extended && /\{.*,.*\}/.match?(@path) && extended_glob_pattern(@path)
+        raise Fluent::ConfigError, "cannot include curly braces with glob patterns in `#{@path}\". Use glob_policy always instead."
+      end
+
       if RESERVED_CHARS.include?(@path_delimiter)
         rc = RESERVED_CHARS.join(', ')
         raise Fluent::ConfigError, "#{rc} are reserved words: #{@path_delimiter}"
@@ -197,7 +208,8 @@ module Fluent::Plugin
       opened_file_metrics = metrics_create(namespace: "fluentd", subsystem: "input", name: "files_opened_total", help_text: "Total number of opened files")
       closed_file_metrics = metrics_create(namespace: "fluentd", subsystem: "input", name: "files_closed_total", help_text: "Total number of closed files")
       rotated_file_metrics = metrics_create(namespace: "fluentd", subsystem: "input", name: "files_rotated_total", help_text: "Total number of rotated files")
-      @metrics = MetricsInfo.new(opened_file_metrics, closed_file_metrics, rotated_file_metrics)
+      throttling_metrics = metrics_create(namespace: "fluentd", subsystem: "input", name: "files_throttled_total", help_text: "Total number of times throttling occurs per file when throttling enabled")
+      @metrics = MetricsInfo.new(opened_file_metrics, closed_file_metrics, rotated_file_metrics, throttling_metrics)
     end
 
     def configure_tag
@@ -267,6 +279,9 @@ module Fluent::Plugin
       @shutdown_start_time = Fluent::Clock.now
       # during shutdown phase, don't close io. It should be done in close after all threads are stopped. See close.
       stop_watchers(existence_path, immediate: true, remove_watcher: false)
+      @tails_rotate_wait.keys.each do |tw|
+        detach_watcher(tw, @tails_rotate_wait[tw][:ino], false)
+      end
       @pf_file.close if @pf_file
 
       super
@@ -275,12 +290,35 @@ module Fluent::Plugin
     def close
       super
       # close file handles after all threads stopped (in #close of thread plugin helper)
+      # It may be because we need to wait IOHanlder.ready_to_shutdown()
       close_watcher_handles
     end
 
     def have_read_capability?
       @capability.have_capability?(:effective, :dac_read_search) ||
         @capability.have_capability?(:effective, :dac_override)
+    end
+
+    def extended_glob_pattern(path)
+      path.include?('*') || path.include?('?') || /\[.*\]/.match?(path)
+    end
+
+    # Curly braces is not supported with default path_delimiter
+    # because the default delimiter of path is ",".
+    # This should be collided for wildcard pattern for curly braces and
+    # be handled as an error on #configure.
+    def use_glob?(path)
+      if @glob_policy == :always
+        # For future extensions, we decided to use `always' term to handle
+        # regular expressions as much as possible.
+        # This is because not using `true' as a returning value
+        # when choosing :always here.
+        extended_glob_pattern(path) || /\{.*,.*\}/.match?(path)
+      elsif @glob_policy == :extended
+        extended_glob_pattern(path)
+      elsif @glob_policy == :backward_compatible
+        path.include?('*')
+      end
     end
 
     def expand_paths
@@ -292,7 +330,7 @@ module Fluent::Plugin
                else
                  date.to_time.strftime(path)
                end
-        if path.include?('*')
+        if use_glob?(path)
           paths += Dir.glob(path).select { |p|
             begin
               is_file = !File.directory?(p)
@@ -327,7 +365,7 @@ module Fluent::Plugin
                else
                  date.to_time.strftime(path)
                end
-        path.include?('*') ? Dir.glob(path) : path
+        use_glob?(path) ? Dir.glob(path) : path
       }.flatten.uniq
       # filter out non existing files, so in case pattern is without '*' we don't do unnecessary work
       hash = {}
@@ -385,13 +423,35 @@ module Fluent::Plugin
         # So that inode can't be contained in `removed_hash`, and can't be unwatched by `stop_watchers`.
         #
         # This logic may work for `@follow_inodes false` too.
-        # Just limiting the case to supress the impact to existing logics.
+        # Just limiting the case to suppress the impact to existing logics.
         @pf&.unwatch_removed_targets(target_paths_hash)
         need_unwatch_in_stop_watchers = false
       end
 
       removed_hash = existence_paths_hash.reject {|key, value| target_paths_hash.key?(key)}
       added_hash = target_paths_hash.reject {|key, value| existence_paths_hash.key?(key)}
+
+      # If an exisiting TailWatcher already follows a target path with the different inode,
+      # it means that the TailWatcher following the rotated file still exists. In this case,
+      # `refresh_watcher` can't start the new TailWatcher for the new current file. So, we
+      # should output a warning log in order to prevent silent collection stops.
+      # (Such as https://github.com/fluent/fluentd/pull/4327)
+      # (Usually, such a TailWatcher should be removed from `@tails` in `update_watcher`.)
+      # (The similar warning may work for `@follow_inodes true` too. Just limiting the case
+      # to suppress the impact to existing logics.)
+      unless @follow_inodes
+        target_paths_hash.each do |path, target|
+          next unless @tails.key?(path)
+          # We can't use `existence_paths_hash[path].ino` because it is from `TailWatcher.ino`,
+          # which is very unstable parameter. (It can be `nil` or old).
+          # So, we need to use `TailWatcher.pe.read_inode`.
+          existing_watcher_inode = @tails[path].pe.read_inode
+          if existing_watcher_inode != target.ino
+            log.warn "Could not follow a file (inode: #{target.ino}) because an existing watcher for that filepath follows a different inode: #{existing_watcher_inode} (e.g. keeps watching a already rotated file). If you keep getting this message, please restart Fluentd.",
+              filepath: target.path
+          end
+        end
+      end
 
       stop_watchers(removed_hash, unwatched: need_unwatch_in_stop_watchers) unless removed_hash.empty?
       start_watchers(added_hash) unless added_hash.empty?
@@ -494,6 +554,9 @@ module Fluent::Plugin
           tw.close
         end
       end
+      @tails_rotate_wait.keys.each do |tw|
+        tw.close
+      end
     end
 
     # refresh_watchers calls @tails.keys so we don't use stop_watcher -> start_watcher sequence for safety.
@@ -504,7 +567,7 @@ module Fluent::Plugin
       if @follow_inodes && new_inode.nil?
         # nil inode means the file disappeared, so we only need to stop it.
         @tails.delete(tail_watcher.path)
-        # https://github.com/fluent/fluentd/pull/4237#issuecomment-1633358632 
+        # https://github.com/fluent/fluentd/pull/4237#issuecomment-1633358632
         # Because of this problem, log duplication can occur during `rotate_wait`.
         # Need to set `rotate_wait 0` for a workaround.
         # Duplication will occur if `refresh_watcher` is called during the `rotate_wait`.
@@ -548,10 +611,6 @@ module Fluent::Plugin
       detach_watcher_after_rotate_wait(tail_watcher, pe.read_inode)
     end
 
-    # TailWatcher#close is called by another thread at shutdown phase.
-    # It causes 'can't modify string; temporarily locked' error in IOHandler
-    # so adding close_io argument to avoid this problem.
-    # At shutdown, IOHandler's io will be released automatically after detached the event loop
     def detach_watcher(tw, ino, close_io = true)
       if @follow_inodes && tw.ino != ino
         log.warn("detach_watcher could be detaching an unexpected tail_watcher with a different ino.",
@@ -564,7 +623,7 @@ module Fluent::Plugin
 
       tw.close if close_io
 
-      if tw.unwatched && @pf
+      if @pf && tw.unwatched && (@follow_inode || !@tails[tw.path])
         target_info = TargetInfo.new(tw.path, ino)
         @pf.unwatch(target_info)
       end
@@ -582,7 +641,11 @@ module Fluent::Plugin
       if @open_on_every_update
         # Detach now because it's already closed, waiting it doesn't make sense.
         detach_watcher(tw, ino)
-      elsif throttling_is_enabled?(tw)
+      end
+
+      return if @tails_rotate_wait[tw]
+
+      if throttling_is_enabled?(tw)
         # When the throttling feature is enabled, it might not reach EOF yet.
         # Should ensure to read all contents before closing it, with keeping throttling.
         start_time_to_wait = Fluent::Clock.now
@@ -590,14 +653,18 @@ module Fluent::Plugin
           elapsed = Fluent::Clock.now - start_time_to_wait
           if tw.eof? && elapsed >= @rotate_wait
             timer.detach
+            @tails_rotate_wait.delete(tw)
             detach_watcher(tw, ino)
           end
         end
+        @tails_rotate_wait[tw] = { ino: ino, timer: timer }
       else
         # when the throttling feature isn't enabled, just wait @rotate_wait
-        timer_execute(:in_tail_close_watcher, @rotate_wait, repeat: false) do
+        timer = timer_execute(:in_tail_close_watcher, @rotate_wait, repeat: false) do
+          @tails_rotate_wait.delete(tw)
           detach_watcher(tw, ino)
         end
+        @tails_rotate_wait[tw] = { ino: ino, timer: timer }
       end
     end
 
@@ -630,14 +697,6 @@ module Fluent::Plugin
 
     # @return true if no error or unrecoverable error happens in emit action. false if got BufferOverflowError
     def receive_lines(lines, tail_watcher)
-      lines = lines.reject do |line|
-        skip_line = @max_line_size ? line.bytesize > @max_line_size : false
-        if skip_line
-          log.warn "received line length is longer than #{@max_line_size}"
-          log.debug "skipped line: #{line.chomp}"
-        end
-        skip_line
-      end
       es = @receive_handler.call(lines, tail_watcher)
       unless es.empty?
         tag = if @tag_prefix || @tag_suffix
@@ -735,6 +794,7 @@ module Fluent::Plugin
           'opened_file_count' => @metrics.opened.get,
           'closed_file_count' => @metrics.closed.get,
           'rotated_file_count' => @metrics.rotated.get,
+          'throttled_log_count' => @metrics.throttled.get,
         })
       }
       stats
@@ -753,6 +813,7 @@ module Fluent::Plugin
         from_encoding: @from_encoding,
         encoding: @encoding,
         metrics: @metrics,
+        max_line_size: @max_line_size,
         &method(:receive_lines)
       )
     end
@@ -945,15 +1006,19 @@ module Fluent::Plugin
       end
 
       class FIFO
-        def initialize(from_encoding, encoding)
+        def initialize(from_encoding, encoding, log, max_line_size=nil)
           @from_encoding = from_encoding
           @encoding = encoding
           @need_enc = from_encoding != encoding
           @buffer = ''.force_encoding(from_encoding)
           @eol = "\n".encode(from_encoding).freeze
+          @max_line_size = max_line_size
+          @skip_current_line = false
+          @skipping_current_line_bytesize = 0
+          @log = log
         end
 
-        attr_reader :from_encoding, :encoding, :buffer
+        attr_reader :from_encoding, :encoding, :buffer, :max_line_size
 
         def <<(chunk)
           # Although "chunk" is most likely transient besides String#force_encoding itself
@@ -985,19 +1050,57 @@ module Fluent::Plugin
 
         def read_lines(lines)
           idx = @buffer.index(@eol)
+          has_skipped_line = false
 
           until idx.nil?
             # Using freeze and slice is faster than slice!
             # See https://github.com/fluent/fluentd/pull/2527
             @buffer.freeze
-            rbuf = @buffer.slice(0, idx + 1)
-            @buffer = @buffer.slice(idx + 1, @buffer.size)
+            slice_position = idx + 1
+            rbuf = @buffer.slice(0, slice_position)
+            @buffer = @buffer.slice(slice_position, @buffer.size - slice_position)
             idx = @buffer.index(@eol)
+
+            is_long_line = @max_line_size && (
+              @skip_current_line || rbuf.bytesize > @max_line_size
+            )
+
+            if is_long_line
+              @log.warn "received line length is longer than #{@max_line_size}"
+              if @skip_current_line
+                @log.debug("The continuing line is finished. Finally discarded data: ") { convert(rbuf).chomp }
+              else
+                @log.debug("skipped line: ") { convert(rbuf).chomp }
+              end
+              has_skipped_line = true
+              @skip_current_line = false
+              @skipping_current_line_bytesize = 0
+              next
+            end
+
             lines << convert(rbuf)
           end
+
+          is_long_current_line = @max_line_size && (
+            @skip_current_line || @buffer.bytesize > @max_line_size
+          )
+
+          if is_long_current_line
+            @log.debug(
+              "The continuing current line length is longer than #{@max_line_size}." +
+              " The received data will be discarded until this line is finished." +
+              " Discarded data: "
+            ) { convert(@buffer).chomp }
+            @skip_current_line = true
+            @skipping_current_line_bytesize += @buffer.bytesize
+            @buffer.clear
+          end
+
+          return has_skipped_line
         end
 
-        def bytesize
+        def reading_bytesize
+          return @skipping_current_line_bytesize if @skip_current_line
           @buffer.bytesize
         end
       end
@@ -1008,15 +1111,14 @@ module Fluent::Plugin
 
         attr_accessor :shutdown_timeout
 
-        def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, log:, open_on_every_update:, from_encoding: nil, encoding: nil, metrics:, &receive_lines)
+        def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, max_line_size: nil, log:, open_on_every_update:, from_encoding: nil, encoding: nil, metrics:, &receive_lines)
           @watcher = watcher
           @path = path
           @read_lines_limit = read_lines_limit
           @read_bytes_limit_per_second = read_bytes_limit_per_second
           @receive_lines = receive_lines
           @open_on_every_update = open_on_every_update
-          @fifo = FIFO.new(from_encoding || Encoding::ASCII_8BIT, encoding || Encoding::ASCII_8BIT)
-          @iobuf = ''.force_encoding('ASCII-8BIT')
+          @fifo = FIFO.new(from_encoding || Encoding::ASCII_8BIT, encoding || Encoding::ASCII_8BIT, log, max_line_size)
           @lines = []
           @io = nil
           @notify_mutex = Mutex.new
@@ -1092,12 +1194,16 @@ module Fluent::Plugin
         end
 
         def handle_notify
-          return if limit_bytes_per_second_reached?
-          return if group_watcher&.limit_lines_reached?(@path)
+          if limit_bytes_per_second_reached? || group_watcher&.limit_lines_reached?(@path)
+            @metrics.throttled.inc
+            return
+          end
 
           with_io do |io|
+            iobuf = ''.force_encoding('ASCII-8BIT')
             begin
               read_more = false
+              has_skipped_line = false
 
               if !io.nil? && @lines.empty?
                 begin
@@ -1105,13 +1211,13 @@ module Fluent::Plugin
                     @start_reading_time ||= Fluent::Clock.now
                     group_watcher&.update_reading_time(@path)
 
-                    data = io.readpartial(BYTES_TO_READ, @iobuf)
+                    data = io.readpartial(BYTES_TO_READ, iobuf)
                     @eof = false
                     @number_bytes_read += data.bytesize
                     @fifo << data
 
                     n_lines_before_read = @lines.size
-                    @fifo.read_lines(@lines)
+                    has_skipped_line = @fifo.read_lines(@lines) || has_skipped_line
                     group_watcher&.update_lines_read(@path, @lines.size - n_lines_before_read)
 
                     group_watcher_limit = group_watcher&.limit_lines_reached?(@path)
@@ -1119,6 +1225,7 @@ module Fluent::Plugin
 
                     if group_watcher_limit || limit_bytes_per_second_reached? || should_shutdown_now?
                       # Just get out from tailing loop.
+                      @metrics.throttled.inc if group_watcher_limit || limit_bytes_per_second_reached?
                       read_more = false
                       break
                     end
@@ -1134,9 +1241,11 @@ module Fluent::Plugin
                 end
               end
 
-              unless @lines.empty?
+              if @lines.empty?
+                @watcher.pe.update_pos(io.pos - @fifo.reading_bytesize) if has_skipped_line
+              else
                 if @receive_lines.call(@lines, @watcher)
-                  @watcher.pe.update_pos(io.pos - @fifo.bytesize)
+                  @watcher.pe.update_pos(io.pos - @fifo.reading_bytesize)
                   @lines.clear
                 else
                   read_more = false
@@ -1148,12 +1257,12 @@ module Fluent::Plugin
 
         def open
           io = Fluent::FileWrapper.open(@path)
-          io.seek(@watcher.pe.read_pos + @fifo.bytesize)
+          io.seek(@watcher.pe.read_pos + @fifo.reading_bytesize)
           @metrics.opened.inc
           io
         rescue RangeError
           io.close if io
-          raise WatcherSetupError, "seek error with #{@path}: file position = #{@watcher.pe.read_pos.to_s(16)}, reading bytesize = #{@fifo.bytesize.to_s(16)}"
+          raise WatcherSetupError, "seek error with #{@path}: file position = #{@watcher.pe.read_pos.to_s(16)}, reading bytesize = #{@fifo.reading_bytesize.to_s(16)}"
         rescue Errno::EACCES => e
           @log.warn "#{e}"
           nil
