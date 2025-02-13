@@ -6,6 +6,7 @@ Fluentd: Open-Source Log Collector
 [![Testing on macOS](https://github.com/fluent/fluentd/actions/workflows/macos-test.yaml/badge.svg?branch=master)](https://github.com/fluent/fluentd/actions/workflows/macos-test.yaml)
 [![Code Climate](https://codeclimate.com/github/fluent/fluentd/badges/gpa.svg)](https://codeclimate.com/github/fluent/fluentd)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1189/badge)](https://bestpractices.coreinfrastructure.org/projects/1189)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/fluent/fluentd/badge)](https://scorecard.dev/viewer/?uri=github.com/fluent/fluentd)
 
 [Fluentd](https://www.fluentd.org/) collects events from various data sources and writes them to files, RDBMS, NoSQL, IaaS, SaaS, Hadoop and so on. Fluentd helps you unify your logging infrastructure (Learn more about the [Unified Logging Layer](https://www.fluentd.org/blog/unified-logging-layer)).
 
@@ -29,7 +30,7 @@ Fluentd: Open-Source Log Collector
 
 ### Prerequisites
 
-- Ruby 2.4 or later
+- Ruby 3.2 or later
 - git
 
 `git` should be in `PATH`. On Windows, you can use `Github for Windows` and `GitShell` for easy setup.
@@ -71,5 +72,3 @@ See [SECURITY](SECURITY.md) to contact us about vulnerability.
 ## Contributors:
 
 Patches contributed by [great developers](https://github.com/fluent/fluentd/contributors).
-
-[<img src="https://ga-beacon.appspot.com/UA-24890265-6/fluent/fluentd" />](https://github.com/fluent/fluentd)

@@ -10,13 +10,17 @@ Gem::Specification.new do |gem|
   gem.summary       = %q{Fluentd event collector}
   gem.homepage      = "https://www.fluentd.org/"
 
-  gem.files         = `git ls-files`.split($\)
+  gem.files         = Dir.chdir(__dir__) do
+    `git ls-files -z`.split("\x0").reject do |f|
+      (File.expand_path(f) == __FILE__) ||
+        f.start_with?(*%w[test/ .git Gemfile])
+    end
+  end
   gem.executables   = gem.files.grep(%r{^bin/}).map{ |f| File.basename(f) }
-  gem.test_files    = gem.files.grep(%r{^(test|spec|features)/})
   gem.require_paths = ["lib"]
   gem.license = "Apache-2.0"
 
-  gem.required_ruby_version = '>= 2.4'
+  gem.required_ruby_version = '>= 3.2'
 
   gem.add_runtime_dependency("bundler")
   gem.add_runtime_dependency("msgpack", [">= 1.3.1", "< 2.0.0"])
@@ -29,6 +33,18 @@ Gem::Specification.new do |gem|
   gem.add_runtime_dependency("tzinfo-data", ["~> 1.0"])
   gem.add_runtime_dependency("strptime", [">= 0.2.4", "< 1.0.0"])
   gem.add_runtime_dependency("webrick", ["~> 1.4"])
+  gem.add_runtime_dependency("zstd-ruby", ["~> 1.5"])
+  gem.add_runtime_dependency("uri", '~> 1.0')
+
+  # gems that aren't default gems as of Ruby 3.4
+  gem.add_runtime_dependency("base64", ["~> 0.2"])
+  gem.add_runtime_dependency("csv", ["~> 3.2"])
+  gem.add_runtime_dependency("drb", ["~> 2.2"])
+
+  # gems that aren't default gems as of Ruby 3.5
+  # logger 1.6.3 or later cause bug on windows,
+  # hold on 1.6.2 for a while. see https://github.com/ruby/logger/issues/107
+  gem.add_runtime_dependency("logger", ["1.6.2"])
 
   # build gem for a certain platform. see also Rakefile
   fake_platform = ENV['GEM_BUILD_FAKE_PLATFORM'].to_s
@@ -45,10 +61,14 @@ Gem::Specification.new do |gem|
   gem.add_development_dependency("parallel_tests", ["~> 0.15.3"])
   gem.add_development_dependency("simplecov", ["~> 0.7"])
   gem.add_development_dependency("rr", ["~> 3.0"])
-  gem.add_development_dependency("timecop", ["~> 0.9"])
+  # timecop v0.9.9 supports `Process.clock_gettime`. It breaks some tests.
+  # (https://github.com/fluent/fluentd/pull/4521)
+  gem.add_development_dependency("timecop", ["< 0.9.9"])
   gem.add_development_dependency("test-unit", ["~> 3.3"])
   gem.add_development_dependency("test-unit-rr", ["~> 1.0"])
   gem.add_development_dependency("oj", [">= 2.14", "< 4"])
-  gem.add_development_dependency("async", "~> 1.23")
-  gem.add_development_dependency("async-http", ">= 0.50.0")
+  gem.add_development_dependency("async-http", "~> 0.86")
+  gem.add_development_dependency("aws-sigv4", ["~> 1.8"])
+  gem.add_development_dependency("aws-sdk-core", ["~> 3.191"])
+  gem.add_development_dependency("rexml", ["~> 3.2"])
 end

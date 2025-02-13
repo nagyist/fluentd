@@ -14,7 +14,7 @@ class HttpHelperTest < Test::Unit::TestCase
   CERT_CA_DIR = File.expand_path(File.dirname(__FILE__) + '/data/cert/with_ca')
 
   def setup
-    @port = unused_port
+    @port = unused_port(protocol: :tcp)
   end
 
   def teardown
@@ -127,12 +127,13 @@ class HttpHelperTest < Test::Unit::TestCase
     end
 
     client = Async::HTTP::Client.new(Async::HTTP::Endpoint.parse("https://#{addr}:#{port}", ssl_context: context))
-    reactor = Async::Reactor.new(nil, logger: Fluent::Log::ConsoleAdapter.wrap(NULL_LOGGER))
+    Console.logger = Fluent::Log::ConsoleAdapter.wrap(NULL_LOGGER)
 
     resp = nil
     error = nil
 
-    reactor.run do
+    Sync do
+      Console.logger = Fluent::Log::ConsoleAdapter.wrap(NULL_LOGGER)
       begin
         response = yield(client)
       rescue => e               # Async::Reactor rescue all error. handle it by myself
@@ -140,7 +141,7 @@ class HttpHelperTest < Test::Unit::TestCase
       end
 
       if response
-        resp = Response.new(response.status.to_s, response.body.read, response.headers)
+        resp = Response.new(response.status.to_s, response.read, response.headers)
       end
     end
 
@@ -152,7 +153,7 @@ class HttpHelperTest < Test::Unit::TestCase
   end
 
   sub_test_case 'Create a HTTP server' do
-    test 'monunt given path' do
+    test 'mount given path' do
       on_driver do |driver|
         driver.http_server_create_http_server(:http_server_helper_test, addr: '127.0.0.1', port: @port, logger: NULL_LOGGER) do |s|
           s.get('/example/hello') { [200, { 'Content-Type' => 'text/plain' }, 'hello get'] }
@@ -176,6 +177,17 @@ class HttpHelperTest < Test::Unit::TestCase
           assert_equal("hello #{n}", resp.body)
           assert_equal('text/plain', resp['Content-Type'])
         end
+      end
+    end
+
+    test 'mount frozen path' do
+      on_driver do |driver|
+        driver.http_server_create_http_server(:http_server_helper_test, addr: '127.0.0.1', port: @port, logger: NULL_LOGGER) do |s|
+          s.get('/example/hello'.freeze) { [200, { 'Content-Type' => 'text/plain' }, 'hello get'] }
+        end
+
+        resp = get("http://127.0.0.1:#{@port}/example/hello/")
+        assert_equal('200', resp.code)
       end
     end
 

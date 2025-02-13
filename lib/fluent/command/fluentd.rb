@@ -46,7 +46,7 @@ op.on('--show-plugin-config=PLUGIN', "[DEPRECATED] Show PLUGIN configuration and
 }
 
 op.on('-p', '--plugin DIR', "add plugin directory") {|s|
-  (cmd_opts[:plugin_dirs] ||= []) << s
+  (cmd_opts[:plugin_dirs] ||= default_opts[:plugin_dirs]) << s
 }
 
 op.on('-I PATH', "add library path") {|s|
@@ -126,6 +126,12 @@ op.on('--suppress-repeated-stacktrace [VALUE]', "suppress repeated stacktrace", 
 op.on('--without-source', "invoke a fluentd without input plugins", TrueClass) {|b|
   cmd_opts[:without_source] = b
 }
+
+unless Fluent.windows?
+  op.on('--with-source-only', "Invoke a fluentd only with input plugins. The data is stored in a temporary buffer. Send SIGWINCH to cancel this mode and process the data (Not supported on Windows).", TrueClass) {|b|
+    cmd_opts[:with_source_only] = b
+  }
+end
 
 op.on('--config-file-type VALU', 'guessing file type of fluentd configuration. yaml/yml or guess') { |s|
   if (s == 'yaml') || (s == 'yml')

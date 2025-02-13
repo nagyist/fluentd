@@ -50,34 +50,43 @@ module Fluent
       def configure_json_parser(name)
         case name
         when :oj
-          raise LoadError unless Fluent::OjOptions.available?
-          [Oj.method(:load), Oj::ParseError]
-        when :json then [JSON.method(:load), JSON::ParserError]
+          return [Oj.method(:load), Oj::ParseError] if Fluent::OjOptions.available?
+
+          log&.info "Oj is not installed, and failing back to JSON for json parser"
+          configure_json_parser(:json)
+        when :json then [JSON.method(:parse), JSON::ParserError]
         when :yajl then [Yajl.method(:load), Yajl::ParseError]
         else
           raise "BUG: unknown json parser specified: #{name}"
         end
-      rescue LoadError => ex
-        name = :yajl
-        if log
-          if /\boj\z/.match?(ex.message)
-            log.info "Oj is not installed, and failing back to Yajl for json parser"
-          else
-            log.warn ex.message
-          end
-        end
-        retry
       end
 
       def parse(text)
-        record = @load_proc.call(text)
-        time = parse_time(record)
-        if @execute_convert_values
-          time, record = convert_values(time, record)
+        parsed_json = @load_proc.call(text)
+
+        if parsed_json.is_a?(Hash)
+          time, record = parse_one_record(parsed_json)
+          yield time, record
+        elsif parsed_json.is_a?(Array)
+          parsed_json.each do |record|
+            unless record.is_a?(Hash)
+              yield nil, nil
+              next
+            end
+            time, parsed_record = parse_one_record(record)
+            yield time, parsed_record
+          end
+        else
+          yield nil, nil
         end
-        yield time, record
+
       rescue @error_class, EncodingError # EncodingError is for oj 3.x or later
         yield nil, nil
+      end
+
+      def parse_one_record(record)
+        time = parse_time(record)
+        convert_values(time, record)
       end
 
       def parser_type

@@ -12,7 +12,8 @@ class ForwardOutputTest < Test::Unit::TestCase
     FileUtils.rm_rf(TMP_DIR)
     FileUtils.mkdir_p(TMP_DIR)
     @d = nil
-    @target_port = unused_port
+    # forward plugin uses TCP and UDP sockets on the same port number
+    @target_port = unused_port(protocol: :all)
   end
 
   def teardown
@@ -156,7 +157,14 @@ EOL
     normal_conf = config_element('match', '**', {}, [
         config_element('server', '', {'name' => 'test', 'host' => 'unexisting.yaaaaaaaaaaaaaay.host.example.com'})
       ])
-    assert_raise SocketError do
+
+    if Socket.const_defined?(:ResolutionError) # as of Ruby 3.3
+      error_class = Socket::ResolutionError
+    else
+      error_class = SocketError
+    end
+
+    assert_raise error_class do
       create_driver(normal_conf)
     end
 
@@ -165,7 +173,7 @@ EOL
       ])
     @d = d = create_driver(conf)
     expected_log = "failed to resolve node name when configured"
-    expected_detail = 'server="test" error_class=SocketError'
+    expected_detail = "server=\"test\" error_class=#{error_class.name}"
     logs = d.logs
     assert{ logs.any?{|log| log.include?(expected_log) && log.include?(expected_detail) } }
   end
@@ -335,6 +343,15 @@ EOL
     assert_equal :gzip, node.instance_variable_get(:@compress)
   end
 
+  test 'set_compress_is_zstd' do
+    @d = d = create_driver(config + %[compress zstd])
+    assert_equal :zstd, d.instance.compress
+    assert_equal :zstd, d.instance.buffer.compress
+
+    node = d.instance.nodes.first
+    assert_equal :zstd, node.instance_variable_get(:@compress)
+  end
+
   test 'set_compress_is_gzip_in_buffer_section' do
     mock = flexmock($log)
     mock.should_receive(:log).with("buffer is compressed.  If you also want to save the bandwidth of a network, Add `compress` configuration in <match>")
@@ -347,6 +364,23 @@ EOL
      ])
     assert_equal :text, d.instance.compress
     assert_equal :gzip, d.instance.buffer.compress
+
+    node = d.instance.nodes.first
+    assert_equal :text, node.instance_variable_get(:@compress)
+  end
+
+  test 'set_compress_is_zstd_in_buffer_section' do
+    mock = flexmock($log)
+    mock.should_receive(:log).with("buffer is compressed.  If you also want to save the bandwidth of a network, Add `compress` configuration in <match>")
+
+    @d = d = create_driver(config + %[
+       <buffer>
+         type memory
+         compress zstd
+       </buffer>
+     ])
+    assert_equal :text, d.instance.compress
+    assert_equal :zstd, d.instance.buffer.compress
 
     node = d.instance.nodes.first
     assert_equal :text, node.instance_variable_get(:@compress)
@@ -542,6 +576,36 @@ EOL
     assert_equal ['test', time, records[1]], events[1]
   end
 
+  test 'send_comprssed_message_pack_stream_if_compress_is_zstd' do
+    target_input_driver = create_target_input_driver
+
+    @d = d = create_driver(config + %[
+      flush_interval 1s
+      compress zstd
+    ])
+
+    time = event_time('2011-01-02 13:14:15 UTC')
+
+    records = [
+      {"a" => 1},
+      {"a" => 2}
+    ]
+    target_input_driver.run(expect_records: 2) do
+      d.run(default_tag: 'test') do
+        records.each do |record|
+          d.feed(time, record)
+        end
+      end
+    end
+
+    event_streams = target_input_driver.event_streams
+    assert_true event_streams[0][1].is_a?(Fluent::CompressedMessagePackEventStream)
+
+    events = target_input_driver.events
+    assert_equal ['test', time, records[0]], events[0]
+    assert_equal ['test', time, records[1]], events[1]
+  end
+
   test 'send_to_a_node_supporting_responses' do
     target_input_driver = create_target_input_driver
 
@@ -603,7 +667,6 @@ EOL
 
     @d = d = create_driver(config + %[
       require_ack_response true
-      ack_response_timeout 1s
       <buffer tag>
         flush_mode immediate
         retry_type periodic
@@ -651,7 +714,6 @@ EOL
 
     @d = d = create_driver(config + %[
       require_ack_response true
-      ack_response_timeout 10s
       <buffer tag>
         flush_mode immediate
         retry_type periodic
@@ -1241,27 +1303,22 @@ EOL
     target_input_driver = create_target_input_driver(conf: target_config)
     output_conf = config
     d = create_driver(output_conf)
-    d.instance_start
 
-    begin
-      chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
-      mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
-                                               linger_timeout: anything,
-                                               send_timeout: anything,
-                                               recv_timeout: anything,
-                                               connect_timeout: anything
-                                              ) { |sock| mock(sock).close.once; sock }.twice
+    chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
+    mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
+                                             linger_timeout: anything,
+                                             send_timeout: anything,
+                                             recv_timeout: anything,
+                                             connect_timeout: anything
+                                            ) { |sock| mock(sock).close.once; sock }.twice
 
-      target_input_driver.run(timeout: 15) do
-        d.run(shutdown: false) do
-          node = d.instance.nodes.first
-          2.times do
-            node.send_data('test', chunk) rescue nil
-          end
+    target_input_driver.run(timeout: 15) do
+      d.run do
+        node = d.instance.nodes.first
+        2.times do
+          node.send_data('test', chunk) rescue nil
         end
       end
-    ensure
-      d.instance_shutdown
     end
   end
 
@@ -1275,7 +1332,6 @@ EOL
       port #{@target_port}
     </server>
     ])
-    d.instance_start
     assert_nothing_raised { d.run }
   end
 
@@ -1287,33 +1343,28 @@ EOL
         keepalive_timeout 2
       ]
       d = create_driver(output_conf)
-      d.instance_start
 
-      begin
-        chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
-        mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
-                                                 linger_timeout: anything,
-                                                 send_timeout: anything,
-                                                 recv_timeout: anything,
-                                                 connect_timeout: anything
-                                                ) { |sock| mock(sock).close.once; sock }.once
+      chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
+      mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
+                                               linger_timeout: anything,
+                                               send_timeout: anything,
+                                               recv_timeout: anything,
+                                               connect_timeout: anything
+                                              ) { |sock| mock(sock).close.once; sock }.once
 
-        target_input_driver.run(timeout: 15) do
-          d.run(shutdown: false) do
-            node = d.instance.nodes.first
-            2.times do
-              node.send_data('test', chunk) rescue nil
-            end
+      target_input_driver.run(timeout: 15) do
+        d.run do
+          node = d.instance.nodes.first
+          2.times do
+            node.send_data('test', chunk) rescue nil
           end
         end
-      ensure
-        d.instance_shutdown
       end
     end
 
     test 'create timer of purging obsolete sockets' do
       output_conf = config + %[keepalive true]
-      d = create_driver(output_conf)
+      @d = d = create_driver(output_conf)
 
       mock(d.instance).timer_execute(:out_forward_heartbeat_request, 1).once
       mock(d.instance).timer_execute(:out_forward_keep_alived_socket_watcher, 5).once
@@ -1329,7 +1380,6 @@ EOL
           keepalive_timeout 2
         ]
         d = create_driver(output_conf)
-        d.instance_start
 
         chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
         mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, @target_port,
